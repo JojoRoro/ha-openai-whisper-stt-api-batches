@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterable
 import io
+import json
 import wave
 
 import requests
@@ -37,6 +38,8 @@ from .const import (
     CONF_PROMPT,
     CONF_TEMPERATURE,
     SUPPORTED_LANGUAGES,
+    BATCH_POLL_INTERVAL,
+    BATCH_MAX_POLL_ATTEMPTS,
 )
 from .whisper_provider import WhisperModel, whisper_providers
 
@@ -131,6 +134,67 @@ class OpenAIWhisperCloudEntity(SpeechToTextEntity):
         """Return a list of supported channels."""
         return [AudioChannels.CHANNEL_MONO, AudioChannels.CHANNEL_STEREO]
 
+    def _derive_result_url(self, post_url: str, batch_id: str) -> str:
+        """Derive the Infomaniak batch result download URL from the POST URL."""
+        # Infomaniak: POST /1/ai/{product_id}/openai/audio/transcriptions
+        # Result:     GET  /1/ai/{product_id}/results/{batch_id}/download
+        if "/openai/audio/transcriptions" in post_url:
+            base = post_url.rsplit("/openai/audio/transcriptions", 1)[0]
+            return f"{base}/results/{batch_id}/download"
+        _LOGGER.warning(
+            "Could not derive batch result URL from %s, using heuristic fallback",
+            post_url,
+        )
+        # Best-effort fallback for non-standard custom URLs
+        parts = post_url.rstrip("/").split("/")
+        base = "/".join(parts[:-2]) if len(parts) > 2 else post_url
+        return f"{base}/results/{batch_id}/download"
+
+    async def _poll_batch_result(
+        self, result_url: str, headers: dict
+    ) -> str | None:
+        """Poll the batch result URL until data is available or timeout."""
+        for attempt in range(1, BATCH_MAX_POLL_ATTEMPTS + 1):
+            try:
+                response = await asyncio.to_thread(
+                    requests.get,
+                    result_url,
+                    headers=headers,
+                )
+                _LOGGER.debug(
+                    "Batch poll attempt %d/%d took %f s and returned %d - %s",
+                    attempt,
+                    BATCH_MAX_POLL_ATTEMPTS,
+                    response.elapsed.seconds,
+                    response.status_code,
+                    response.reason,
+                )
+
+                if response.status_code == 200:
+                    body = response.text
+                    if body and body.strip():
+                        _LOGGER.debug("Batch result body received")
+                        return body.strip()
+                    # Body is empty, not ready yet
+                elif response.status_code == 404:
+                    _LOGGER.debug("Batch result not ready (404), retrying...")
+                else:
+                    _LOGGER.warning(
+                        "Unexpected status %d from batch result URL: %s",
+                        response.status_code,
+                        response.text,
+                    )
+            except requests.exceptions.RequestException as e:
+                _LOGGER.warning("Batch poll request exception: %s", e)
+
+            await asyncio.sleep(BATCH_POLL_INTERVAL)
+
+        _LOGGER.error(
+            "Batch transcription timed out after %d attempts",
+            BATCH_MAX_POLL_ATTEMPTS,
+        )
+        return None
+
     async def async_process_audio_stream(
         self, metadata: SpeechMetadata, stream: AsyncIterable[bytes]
     ) -> SpeechResult:
@@ -188,28 +252,81 @@ class OpenAIWhisperCloudEntity(SpeechToTextEntity):
             }
 
             # Make the request in a separate thread
+            post_url = (
+                f"{self.api_url}/v1/audio/transcriptions"
+                if not self.custom
+                else self.api_url
+            )
             response = await asyncio.to_thread(
                 requests.post,
-                f"{self.api_url}/v1/audio/transcriptions" if not self.custom else self.api_url,
+                post_url,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                 },
                 files=files,
-                data=data
+                data=data,
             )
 
-            _LOGGER.debug("Transcription request took %f s and returned %d - %s", response.elapsed.seconds, response.status_code, response.reason)
+            _LOGGER.debug(
+                "Transcription request took %f s and returned %d - %s",
+                response.elapsed.seconds,
+                response.status_code,
+                response.reason,
+            )
 
-            # Parse the JSON response
-            transcription = response.json().get("text", "")
-
-            _LOGGER.debug("TRANSCRIPTION: %s", transcription)
-
-            if not transcription:
-                _LOGGER.error(response.text)
+            if response.status_code >= 400:
+                _LOGGER.error(
+                    "Transcription request failed with %d: %s",
+                    response.status_code,
+                    response.text,
+                )
                 return SpeechResult("", SpeechResultState.ERROR)
 
-            return SpeechResult(transcription, SpeechResultState.SUCCESS)
+            try:
+                result_json = response.json()
+            except (json.JSONDecodeError, ValueError):
+                _LOGGER.error("Failed to decode JSON response: %s", response.text)
+                return SpeechResult("", SpeechResultState.ERROR)
+
+            # Fast path: synchronous response with text
+            if "text" in result_json:
+                transcription = result_json.get("text", "")
+                _LOGGER.debug("TRANSCRIPTION (sync): %s", transcription)
+                if transcription:
+                    return SpeechResult(transcription, SpeechResultState.SUCCESS)
+                _LOGGER.error("Empty transcription in sync response")
+                return SpeechResult("", SpeechResultState.ERROR)
+
+            # Batch path: async response with batch_id
+            batch_id = result_json.get("batch_id")
+            if batch_id:
+                _LOGGER.info("Batch ID received: %s", batch_id)
+                result_url = self._derive_result_url(post_url, batch_id)
+                _LOGGER.debug("Polling batch result at %s", result_url)
+
+                result_body = await self._poll_batch_result(
+                    result_url,
+                    {"Authorization": f"Bearer {self.api_key}"},
+                )
+                if result_body is None:
+                    return SpeechResult("", SpeechResultState.ERROR)
+
+                try:
+                    result_data = json.loads(result_body)
+                    transcription = result_data.get("text", "")
+                except (json.JSONDecodeError, AttributeError):
+                    transcription = result_body
+
+                _LOGGER.debug("TRANSCRIPTION (batch): %s", transcription)
+
+                if transcription:
+                    return SpeechResult(transcription, SpeechResultState.SUCCESS)
+
+                _LOGGER.error("Empty transcription from batch result")
+                return SpeechResult("", SpeechResultState.ERROR)
+
+            _LOGGER.error("Unexpected response: %s", response.text)
+            return SpeechResult("", SpeechResultState.ERROR)
 
         except requests.exceptions.RequestException as e:
             _LOGGER.error(e)
