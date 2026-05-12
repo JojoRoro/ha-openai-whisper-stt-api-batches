@@ -1,6 +1,8 @@
-# Whisper STT Cloud API integration for Home Assistant 🏠🎙️
+# Whisper STT Cloud API integration for Home Assistant 🏠🎙️ | Infomaniak Version
 
 This HA custom integration lets you use any compatible OpenAI API (OpenAI, GroqCloud, Mistral AI, others coming ...) for computing speech-to-text in cloud, reducing workload on Home Assistant server.
+
+This version adds support for asynchronous/batch-based STT providers such as **Infomaniak** by automatically polling for batch results when a `batch_id` is returned instead of an immediate transcription.
 
 ## Sources
 
